@@ -95,6 +95,12 @@ class KVCacheCoordinator(ABC):
             for g in kv_cache_config.kv_cache_groups
         )
         self.scheduler_block_size = scheduler_block_size
+        # hash_block_size: the block size used to compute block hashes.
+        # The actual block size usually equals hash_block_size, but in cases
+        # where different KV cache groups have different block sizes -- or a
+        # finer ``prefix_match_unit`` is configured -- the actual block size
+        # can be a multiple of hash_block_size.
+        self.hash_block_size = hash_block_size
         self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
 
         self.block_pool = BlockPool(
@@ -520,12 +526,54 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         self.block_size = self.single_type_managers[0].block_size
         # For models using only Mamba, block_size is set to max_model_len when
         # prefix caching is disabled, and hash_block_size validation is skipped.
-        assert not enable_caching or (hash_block_size == self.block_size), (
-            "UnitaryKVCacheCoordinator assumes hash_block_size == block_size"
+        assert not enable_caching or self.block_size % hash_block_size == 0, (
+            "UnitaryKVCacheCoordinator requires block_size to be a multiple of "
+            "hash_block_size"
         )
         assert len(self.kv_cache_config.kv_cache_groups) == 1, (
             "UnitaryKVCacheCoordinator assumes only one kv cache group"
         )
+        # Fine-grained (sub-block) prefix-cache hits: active when the resolver
+        # produced a hash granularity finer than the physical block size
+        # (``--prefix-match-unit``). Requires a manager with fine-grained hash
+        # lookup; context parallelism shards blocks across ranks and is out of
+        # scope for now.
+        manager = self.single_type_managers[0]
+        self.enable_partial_hash_hits = (
+            enable_caching
+            and hash_block_size < self.block_size
+            and manager.supports_fine_grained_hash_lookup
+            and self.dcp_world_size == 1
+            and self.pcp_world_size == 1
+        )
+        if (
+            enable_caching
+            and hash_block_size < self.block_size
+            and not self.enable_partial_hash_hits
+        ):
+            # hash_block_size < block_size only happens on an explicit
+            # ``prefix_match_unit`` override, so reject loudly instead of
+            # silently falling back to block-aligned hits.
+            raise ValueError(
+                f"prefix_match_unit={hash_block_size} < block_size="
+                f"{self.block_size} requires fine-grained prefix-cache "
+                f"lookup, which {type(manager).__name__} does not support "
+                "(or DCP/PCP is enabled)."
+            )
+        if (
+            self.enable_partial_hash_hits
+            and self.eagle_group_ids
+            and hash_block_size < num_prefill_lookahead
+        ):
+            # Partial hits land on hash boundaries, so the EAGLE/MTP excluded
+            # tail shrinks from scheduler_block_size to hash_block_size (see
+            # the drop logic in FullAttentionManager.find_longest_cache_hit).
+            raise ValueError(
+                f"Multi-module MTP with prefix caching requires "
+                f"prefix_match_unit (={hash_block_size}) >= "
+                f"num_speculative_tokens (={num_prefill_lookahead})."
+            )
+        manager.cache_hit_alignment_tokens = self._cache_hit_alignment_tokens
         # Single group; useless but just set ``use_eagle`` for consistency regardless.
         self.single_type_managers[0].use_eagle = 0 in self.eagle_group_ids
 
@@ -541,7 +589,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             block_pool=self.block_pool,
             kv_cache_spec=self.kv_cache_spec,
             drop_eagle_block=0 in self.eagle_group_ids,
-            alignment_tokens=self.block_size,
+            alignment_tokens=self._cache_hit_alignment_tokens,
             dcp_world_size=self.dcp_world_size,
             pcp_world_size=self.pcp_world_size,
         )
@@ -599,11 +647,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             metrics_collector=metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
         )
-        # hash_block_size: the block size used to compute block hashes.
-        # The actual block size usually equals hash_block_size, but in cases where
-        # different KV cache groups have different block sizes, the actual block size
-        # can be a multiple of hash_block_size.
-        self.hash_block_size = hash_block_size
         self.dcp_world_size = dcp_world_size
         # Only groups that participate in prefix caching must satisfy the
         # divisibility constraint; groups that opt out (e.g. GLM-5.3-Flash kpool

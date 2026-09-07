@@ -722,7 +722,44 @@ def resolve_kv_cache_block_sizes(
 
     if len(groups) <= 1:
         bs = cache_config.block_size * dcp
-        return bs, bs
+        requested = cache_config.prefix_match_unit
+        # Block hashes are only consumed by prefix caching and KV connectors;
+        # when neither is active (or no override is given), keep the historical
+        # hash_block_size == block_size behavior.
+        hashing_active = (
+            cache_config.enable_prefix_caching
+            or vllm_config.kv_transfer_config is not None
+        )
+        if not groups or requested is None or requested == bs or not hashing_active:
+            return bs, bs
+        if any(
+            isinstance(spec, MambaSpec)
+            for spec in iter_layer_specs(groups[0].kv_cache_spec)
+        ):
+            raise ValueError(
+                f"prefix_match_unit={requested} is not supported for Mamba-only "
+                "models: each cache block stores a single recurrent state, so "
+                "there is no interior boundary a finer match unit could hit."
+            )
+        if bs % requested != 0:
+            raise ValueError(
+                f"Invalid prefix_match_unit={requested}; the KV cache block "
+                f"size ({bs}) must be divisible by prefix_match_unit."
+            )
+        single_group_alignments = {
+            spec.tokens_per_state
+            for spec in iter_layer_specs(groups[0].kv_cache_spec)
+            if spec.prefix_cacheable
+            and isinstance(spec.tokens_per_state, int)
+            and spec.tokens_per_state > 1
+        }
+        if any(requested % alignment for alignment in single_group_alignments):
+            raise ValueError(
+                f"Invalid prefix_match_unit={requested}; prefix-cache "
+                "boundaries must align with each spec's per-state compression. "
+                f"Got alignments={sorted(single_group_alignments)}."
+            )
+        return bs, requested
 
     group_block_sizes = [
         resolve_dcp_kv_block_size(g.kv_cache_spec, dcp) for g in groups

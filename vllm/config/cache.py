@@ -102,10 +102,12 @@ class CacheConfig:
 
     Prefix-cache keys are computed every `prefix_match_unit` tokens. It can
     be set finer than the physical KV cache block sizes (e.g. 32 vs a
-    1024-token hybrid-model block) as long as every KV cache group's
-    `block_size` is divisible by it, enabling cache hits at boundaries
-    inside a physical block. It controls matching granularity only, not how
-    often states are stored.
+    1024-token hybrid-model block, or 16 vs a large single-group
+    full-attention block) as long as every KV cache group's `block_size` is
+    divisible by it, enabling cache hits at boundaries inside a physical
+    block. Supported for aligned full-attention + Mamba hybrid models and
+    for single-group full-attention models. It controls matching granularity
+    only, not how often states are stored.
 
     This equals to the `hash_block_size` used throughout the KV cache code.
     """
